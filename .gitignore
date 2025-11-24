@@ -1,0 +1,12 @@
+.vscode
+synthetic-dataset.zip
+synthetic-dataset
+**/*/.venv
+**/*/.env
+**/*/.DS_Store
+.DS_Store
+**/test_output
+**/test_output_train
+**/test_dataset_dummy
+**/test_dataset_dummy_train
+
