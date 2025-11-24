@@ -52,7 +52,9 @@ uv run train.py \
 *   `--model_id`: Base model ID (default: "unsloth/csm-1b").
 *   `--seed`: Random seed (default: 3407).
 *   `--use_wandb`: Flag to enable Weights & Biases tracking (requires `WANDB_API_KEY` in `.env`).
+*   `--full_finetune`: Flag to finetune all weights instead of using LoRA (default: False).
 *   `--warmup_steps`: Warmup steps (default: 5).
+*   `--weight_decay`: Weight decay (default: 0.001).
 *   `--weight_decay`: Weight decay (default: 0.001).
 *   `--lr_scheduler_type`: Learning rate scheduler type (default: "linear").
 *   `--max_grad_norm`: Max gradient norm (default: 1.0).

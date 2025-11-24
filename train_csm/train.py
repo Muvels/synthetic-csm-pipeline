@@ -29,6 +29,7 @@ def parse_args():
         "model_id": "unsloth/csm-1b",
         "seed": 3407,
         "use_wandb": False,
+        "full_finetune": False,
         "warmup_steps": 5,
         "weight_decay": 0.001,
         "lr_scheduler_type": "linear",
@@ -67,6 +68,7 @@ def parse_args():
     parser.add_argument("--model_id", type=str, default=defaults["model_id"], help="Model ID to load.")
     parser.add_argument("--seed", type=int, default=defaults["seed"], help="Random seed.")
     parser.add_argument("--use_wandb", action="store_true", default=defaults["use_wandb"], help="Enable Weights & Biases tracking.")
+    parser.add_argument("--full_finetune", action="store_true", default=defaults["full_finetune"], help="Finetune all weights (disable LoRA).")
     
     # New arguments from config
     parser.add_argument("--warmup_steps", type=int, default=defaults["warmup_steps"], help="Warmup steps.")
@@ -88,25 +90,28 @@ def main():
         model_name = args.model_id,
         max_seq_length = 2048, # From notebook context section
         dtype = None, # Auto detection
-        load_in_4bit = False, # Disable 4bit quantization for macOS compatibility
+        load_in_4bit = False, # Disable 4bit quantization for macOS compatibility (and for full finetuning usually)
     )
 
-    # Configure LoRA adapters
-    # The notebook output showed "Trainable parameters = 29M", which implies LoRA.
-    # We need to apply LoRA adapters to the model.
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r = 32, # Standard LoRA rank
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj",],
-        lora_alpha = 32,
-        lora_dropout = 0, # Supports any, but = 0 is optimized
-        bias = "none",    # Supports any, but = "none" is optimized
-        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
-        random_state = args.seed,
-        use_rslora = False,  # We support rank stabilized LoRA
-        loftq_config = None, # And LoftQ
-    )
+    if not args.full_finetune:
+        # Configure LoRA adapters
+        # The notebook output showed "Trainable parameters = 29M", which implies LoRA.
+        # We need to apply LoRA adapters to the model.
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r = 32, # Standard LoRA rank
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                              "gate_proj", "up_proj", "down_proj",],
+            lora_alpha = 32,
+            lora_dropout = 0, # Supports any, but = 0 is optimized
+            bias = "none",    # Supports any, but = "none" is optimized
+            use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+            random_state = args.seed,
+            use_rslora = False,  # We support rank stabilized LoRA
+            loftq_config = None, # And LoftQ
+        )
+    else:
+        print("Full finetuning enabled. LoRA adapters will NOT be added.")
 
     print(f"Loading dataset from {args.dataset_path}")
     dataset_path = Path(args.dataset_path)
