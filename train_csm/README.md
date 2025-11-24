@@ -44,7 +44,8 @@ uv run train.py \
 *   `--config`: Path to a YAML configuration file (e.g., `configs/finetune_param_defaults_bs4.yaml`). Values in the config file override defaults, but can be overridden by explicit CLI arguments.
 *   `--dataset_path`: Path to the directory containing the prepared Arrow shards (output of `prepare_dataset_for_training.py`).
 *   `--output_dir`: Directory to save the trained model and checkpoints.
-*   `--max_steps`: Total number of training steps (default: 60).
+*   `--max_steps`: Total number of training steps (default: -1, uses epochs).
+*   `--n_epochs`: Number of training epochs (default: 2).
 *   `--batch_size`: Per-device training batch size (default: 2).
 *   `--gradient_accumulation_steps`: Number of gradient accumulation steps (default: 4).
 *   `--learning_rate`: Learning rate (default: 2e-4).

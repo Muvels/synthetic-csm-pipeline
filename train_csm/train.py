@@ -21,7 +21,8 @@ def parse_args():
     defaults = {
         "dataset_path": None,
         "output_dir": "./outputs",
-        "max_steps": 60,
+        "max_steps": -1, # Default to -1 so epochs take precedence
+        "num_train_epochs": 2,
         "batch_size": 2,
         "gradient_accumulation_steps": 4,
         "learning_rate": 2e-4,
@@ -43,6 +44,7 @@ def parse_args():
                 mapping = {
                     "grad_acc_steps": "gradient_accumulation_steps",
                     "lr_decay": "lr_scheduler_type",
+                    "n_epochs": "num_train_epochs",
                 }
                 for k, v in config.items():
                     key = mapping.get(k, k)
@@ -57,7 +59,8 @@ def parse_args():
     parser.add_argument("--config", type=str, help="Path to YAML config file.")
     parser.add_argument("--dataset_path", type=str, required=defaults["dataset_path"] is None, default=defaults["dataset_path"], help="Path to the prepared dataset directory containing shards.")
     parser.add_argument("--output_dir", type=str, default=defaults["output_dir"], help="Path to save the trained model/checkpoints.")
-    parser.add_argument("--max_steps", type=int, default=defaults["max_steps"], help="Max training steps.")
+    parser.add_argument("--max_steps", type=int, default=defaults["max_steps"], help="Max training steps. Set to -1 to use epochs.")
+    parser.add_argument("--n_epochs", type=int, default=defaults["num_train_epochs"], help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=defaults["batch_size"], help="Per device train batch size.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=defaults["gradient_accumulation_steps"], help="Gradient accumulation steps.")
     parser.add_argument("--learning_rate", type=float, default=defaults["learning_rate"], help="Learning rate.")
@@ -132,6 +135,7 @@ def main():
         gradient_accumulation_steps = args.gradient_accumulation_steps,
         warmup_steps = args.warmup_steps,
         max_steps = args.max_steps,
+        num_train_epochs = args.n_epochs,
         learning_rate = args.learning_rate,
         fp16 = not is_bfloat16_supported(),
         bf16 = is_bfloat16_supported(),
