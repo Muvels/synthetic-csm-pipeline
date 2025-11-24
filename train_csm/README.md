@@ -17,7 +17,7 @@ This project uses `uv` for dependency management.
 Create a `.env` file in this directory to store your secrets (e.g., WandB API key):
 
 ```bash
-WANDB_API_KEY=your_api_key_here
+cp .env.example .env
 ```
 
 ```bash
@@ -35,7 +35,7 @@ uv run train.py \
     --dataset_path ../prep_for_training/prepared_dataset \
     --output_dir ./outputs \
     --config ./configs/finetune_param_defaults_bs4.yaml \
-    --max_steps 60 \
+    --gen_from ./example_gen \
     --use_wandb
 ```
 
