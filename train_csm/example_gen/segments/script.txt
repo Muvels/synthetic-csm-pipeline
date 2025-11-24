@@ -1,0 +1,7 @@
+[1]: Willkommen zu unserer heutigen Vertiefung.
+[1]: Du hast uns da ein Dokument auf den Tisch gelegt, das auf den ersten Blick echt Respekt einflößt: Analysis für Informatiker von Christian Zerpe.
+[1]: Ein Uniskript.
+[1]: Dicht, voller Symbole.
+[1]: Da denkt man ja sofort, das ist nur was für absolute Hardcore-Mathematiker.
+[2]: Ja, das sieht erstmal aus wie eine Wand aus Hieroglyphen, das stimmt schon.
+[1]: Aber genau das ist ja unsere Mission heute.

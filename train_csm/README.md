@@ -58,6 +58,25 @@ uv run train.py \
 *   `--weight_decay`: Weight decay (default: 0.001).
 *   `--lr_scheduler_type`: Learning rate scheduler type (default: "linear").
 *   `--max_grad_norm`: Max gradient norm (default: 1.0).
+*   `--gen_every`: Generate audio sample every N steps (default: 1000).
+*   `--gen_from`: Path to a folder containing `segments/script.txt` and audio files for generation context (e.g., `example_gen`).
+
+### Inference
+
+You can also generate audio using the trained model (or base model) without training:
+
+```bash
+uv run inference.py \
+    --model_path unsloth/csm-1b \
+    --input_dir ./example_gen \
+    --output_dir ./inference_output
+```
+
+**Arguments:**
+*   `--model_path`: Path to the trained model directory or Hugging Face model ID.
+*   `--input_dir`: Path to the folder containing `segments/script.txt` and audio context.
+*   `--output_dir`: Directory to save the generated audio.
+*   `--load_in_4bit`: Flag to load the model in 4-bit quantization (useful for low VRAM).
 
 ## Hardware Requirements
 

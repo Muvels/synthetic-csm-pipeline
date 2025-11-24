@@ -7,6 +7,11 @@ from unsloth import FastLanguageModel, is_bfloat16_supported
 from pathlib import Path
 from dotenv import load_dotenv
 import yaml
+import soundfile as sf
+import re
+import numpy as np
+import wandb
+from generation import AudioGenerationCallback
 
 load_dotenv()
 
@@ -30,6 +35,8 @@ def parse_args():
         "seed": 3407,
         "use_wandb": False,
         "full_finetune": False,
+        "gen_every": 1000,
+        "gen_from": None,
         "warmup_steps": 5,
         "weight_decay": 0.001,
         "lr_scheduler_type": "linear",
@@ -69,6 +76,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=defaults["seed"], help="Random seed.")
     parser.add_argument("--use_wandb", action="store_true", default=defaults["use_wandb"], help="Enable Weights & Biases tracking.")
     parser.add_argument("--full_finetune", action="store_true", default=defaults["full_finetune"], help="Finetune all weights (disable LoRA).")
+    parser.add_argument("--gen_every", type=int, default=defaults["gen_every"], help="Generate audio every N steps.")
+    parser.add_argument("--gen_from", type=str, default=defaults["gen_from"], help="Path to example folder for generation (e.g. train_csm/example_gen).")
     
     # New arguments from config
     parser.add_argument("--warmup_steps", type=int, default=defaults["warmup_steps"], help="Warmup steps.")
@@ -155,11 +164,17 @@ def main():
     )
 
     print("Starting training...")
+    
+    callbacks = []
+    if args.gen_from:
+        callbacks.append(AudioGenerationCallback(args.gen_from, args.gen_every, tokenizer, args.use_wandb, args.output_dir))
+        
     trainer = Trainer(
         model = model,
         tokenizer = tokenizer,
         train_dataset = train_dataset,
         args = training_args,
+        callbacks = callbacks
     )
     
     trainer_stats = trainer.train()
