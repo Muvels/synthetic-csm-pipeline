@@ -9,4 +9,5 @@ synthetic-dataset
 **/test_output_train
 **/test_dataset_dummy
 **/test_dataset_dummy_train
+**/dataset-for-training
 

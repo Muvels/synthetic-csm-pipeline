@@ -9,6 +9,7 @@ from tqdm import tqdm
 from datasets import Dataset, Audio, concatenate_datasets, load_from_disk
 from transformers import AutoProcessor
 import numpy as np
+import gc
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Prepare conversational dataset for Sesame CSM training.")
@@ -127,162 +128,45 @@ def create_contextual_samples(conversation_turns, max_history=None):
         
     return samples
 
-def process_batch(batch_conversations, processor, target_sr, max_history, max_audio_samples):
-    """Processes a batch of conversations into a Dataset."""
-    all_samples = []
+def process_batch_and_save(batch_conversations, processor, target_sr, max_history, output_path):
+    """Processes a batch of conversations and saves directly to disk to save RAM."""
     
-    for conv_dir in batch_conversations:
-        turns = parse_conversation(conv_dir)
-        if not turns:
-            continue
+    def generator():
+        for conv_dir in batch_conversations:
+            turns = parse_conversation(conv_dir)
+            if not turns:
+                continue
+                
+            conv_samples = create_contextual_samples(turns, max_history)
             
-        conv_samples = create_contextual_samples(turns, max_history)
-        all_samples.extend(conv_samples)
-        
-    if not all_samples:
-        return None
+            for sample in conv_samples:
+                # Yield the raw sample directly.
+                # The training script will handle audio loading and tokenization.
+                # sample structure: {"conversation": [...], "target_audio": ..., "target_text": ..., "speaker": ...}
+                yield sample
+            
+            # No need for explicit gc.collect() as much if we aren't loading audio, 
+            # but keeping it doesn't hurt for the loop variables.
+            # gc.collect()
 
-    # Create HF Dataset
-    # We need to be careful with the 'conversation' column structure for HF Dataset
-    # It might be better to keep it as a list of dicts (JSON-like) until processing
-    
-    # However, for 'audio' feature to work, we usually need a specific column.
-    # But here, the audio paths are INSIDE the conversation structure.
-    # The processor.apply_chat_template handles loading if we pass it right.
-    # But for saving to disk efficiently, we might want HF to handle audio loading?
-    
-    # Strategy:
-    # We will NOT cast to Audio feature immediately for the history to avoid massive duplication in RAM/Disk 
-    # if we are just storing paths. 
-    # WAIT. If we use Audio feature, HF datasets will load the audio.
-    # If we have context, we are duplicating audio data for every turn if we flatten it.
-    # E.g. Turn 1 audio is in Sample 1 (target), Sample 2 (history), Sample 3 (history)...
-    
-    # Better approach for storage:
-    # Store the 'conversation' as a structure with PATHS.
-    # We will apply the processor transformation on-the-fly during training or 
-    # if we must pre-process now, we accept the storage cost.
-    
-    # The user request says: "make sure you not take to much ram by wrinting prepared samples to disk in batches."
-    # And "adjust the data prep script ... to give the sentences before as context".
-    
-    # Let's try to apply the processor here to get the final tokenized inputs?
-    # The notebook does: `model_inputs = processor.apply_chat_template(...)`
-    # This returns input_ids, attention_mask, etc.
-    # This is what we should save!
-    
-    # BUT, `apply_chat_template` loads audio. If we do this for the whole dataset, it might be huge.
-    # However, that IS the "prepared" dataset.
-    
-    def transform_sample(sample):
-        # sample["conversation"] contains paths.
-        # We need to load audio for the processor? 
-        # The processor can handle paths if configured, but usually expects arrays for "audio" type?
-        # Let's check the notebook. 
-        # Notebook: `audio_array = example["audio"]["array"]` -> passed to content.
+    try:
+        # Use from_generator to stream processing
+        # This writes to a cache file on disk instead of holding everything in RAM
+        # writer_batch_size=1 ensures we flush to disk after EVERY sample, keeping RAM usage low.
+        ds = Dataset.from_generator(generator, writer_batch_size=1)
         
-        # So we need to load audio.
-        # To avoid OOM, we do this one by one or in small sub-batches.
+        if len(ds) == 0:
+            return False
+            
+        ds.save_to_disk(str(output_path))
+        return True
         
-        conversation = sample["conversation"]
-        # Load audio for each turn in conversation
-        processed_conversation = []
-        
-        for msg in conversation:
-            new_content = []
-            for item in msg["content"]:
-                if item["type"] == "audio":
-                    # Load audio
-                    try:
-                        audio_path = item["path"]
-                        # sf.read returns (data, samplerate)
-                        # We might need resampling if not target_sr
-                        # Using librosa or sf.
-                        # For simplicity/speed let's assume we might need resampling or check.
-                        # But to be safe and robust:
-                        # We can use the Dataset.cast_column("audio") trick on a temporary dataset?
-                        # Or just use soundfile/librosa.
-                        
-                        # Let's use soundfile and assume we might need to resample if different.
-                        # Actually, the notebook uses `raw_ds.cast_column("audio", Audio(sampling_rate=target_sampling_rate))`
-                        # We can replicate that logic or just load manually.
-                        
-                        # Manual load to ensure control:
-                        data, sr = sf.read(audio_path)
-                        if sr != target_sr:
-                            # Resample if needed (requires librosa or scipy)
-                            import librosa
-                            data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
-                            
-                        new_content.append({"type": "audio", "path": data, "sampling_rate": target_sr}) # Processor expects array in 'path' key sometimes or 'array'?
-                        # Wait, notebook says: `{"type": "audio", "path": audio_array}`. 
-                        # It seems unsloth/csm-1b processor handles numpy array in "path" field for "audio" type? 
-                        # That's a bit unusual naming but if it works in notebook...
-                        # Notebook line 3486: `{"type": "audio", "path": audio_array}`
-                        
-                    except Exception as e:
-                        print(f"Failed to load {audio_path}: {e}")
-                        # If audio fails, this sample is bad.
-                        return None
-                else:
-                    new_content.append(item)
-            
-            processed_conversation.append({
-                "role": msg["role"],
-                "content": new_content
-            })
-            
-        try:
-            model_inputs = processor.apply_chat_template(
-                processed_conversation,
-                tokenize=True,
-                return_dict=True,
-                output_labels=True, # We want labels for training
-                text_kwargs={
-                    "padding": "max_length",
-                    "max_length": 256, # From notebook
-                    "pad_to_multiple_of": 8,
-                    "padding_side": "right",
-                },
-                # Audio kwargs? Notebook doesn't show explicit audio kwargs in apply_chat_template call 
-                # but it might be using defaults.
-            )
-            return model_inputs
-        except Exception as e:
-            print(f"Error processing sample: {e}")
-            return None
-
-    # We process the samples in this batch
-    processed_data = {
-        "input_ids": [],
-        "attention_mask": [],
-        "labels": [], # If output_labels=True
-        # "pixel_values": [] # If audio is converted to spectrograms/features? 
-        # The processor output depends on the model. CSM likely uses input_ids/labels + maybe pixel_values or similar for audio?
-        # Let's inspect what apply_chat_template returns in the notebook if possible, 
-        # but we can just collect all keys returned.
-    }
-    
-    # To collect keys dynamically
-    collected_keys = set()
-    
-    valid_samples = []
-    for sample in all_samples:
-        out = transform_sample(sample)
-        if out:
-            valid_samples.append(out)
-            collected_keys.update(out.keys())
-            
-    if not valid_samples:
-        return None
-        
-    # Collate
-    final_batch = {k: [] for k in collected_keys}
-    for item in valid_samples:
-        for k in collected_keys:
-            final_batch[k].append(item[k])
-            
-    return Dataset.from_dict(final_batch)
+    except Exception as e:
+        print(f"Error creating dataset from generator: {e}")
+        # If it's an empty dataset error, we might want to handle it, but from_generator usually handles empty gen?
+        # It might raise error if features are not inferred.
+        # But we can't easily infer features without data.
+        raise e
 
 def main():
     args = parse_args()
@@ -350,17 +234,16 @@ def main():
         print(f"Processing batch {current_shard_index} ({i}/{total_convs})...")
         
         try:
-            ds_shard = process_batch(
+            shard_path = output_dir / f"shard_{current_shard_index}.arrow"
+            success = process_batch_and_save(
                 batch_dirs, 
                 processor, 
                 args.target_sampling_rate, 
                 args.max_history,
-                max_audio_samples
+                shard_path
             )
             
-            if ds_shard:
-                shard_path = output_dir / f"shard_{current_shard_index}.arrow"
-                ds_shard.save_to_disk(str(shard_path))
+            if success:
                 print(f"Saved shard to {shard_path}")
             else:
                 print("Batch resulted in no valid samples.")

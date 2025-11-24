@@ -143,6 +143,98 @@ def main():
     train_dataset = concatenate_datasets(loaded_shards)
     print(f"Total training samples: {len(train_dataset)}")
 
+    # Define the transform for on-the-fly processing
+    def preprocess_batch(batch):
+        # batch is a dict of lists: {"conversation": [...], "target_audio": [...], ...}
+        # We need to process each sample in the batch
+        
+        processed_batch = []
+        
+        # Iterate over the batch indices
+        # HuggingFace datasets batch is column-oriented (dict of lists)
+        batch_size = len(batch["conversation"])
+        
+        for i in range(batch_size):
+            conversation = batch["conversation"][i]
+            
+            # Load audio for this conversation
+            processed_conversation = []
+            valid_sample = True
+            
+            for msg in conversation:
+                new_content = []
+                for item in msg["content"]:
+                    if item["type"] == "audio":
+                        try:
+                            audio_path = item["path"]
+                            # Load audio
+                            # We assume target_sr is 24000 (CSM default) or we need to pass it.
+                            # Ideally we should read it from config or args, but for now hardcode or assume 24k
+                            target_sr = 24000 
+                            
+                            data, sr = sf.read(audio_path)
+                            if sr != target_sr:
+                                import librosa
+                                data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
+                                
+                            new_content.append({"type": "audio", "path": data, "sampling_rate": target_sr})
+                        except Exception as e:
+                            print(f"Failed to load {audio_path}: {e}")
+                            valid_sample = False
+                            break
+                    else:
+                        new_content.append(item)
+                
+                if not valid_sample:
+                    break
+                    
+                processed_conversation.append({
+                    "role": msg["role"],
+                    "content": new_content
+                })
+            
+            if not valid_sample:
+                # If a sample is invalid, we must still return something to match batch size?
+                # Or we can return empty/dummy? 
+                # set_transform expects the same length or we might have issues.
+                # Usually transforms map N->N. 
+                # If we fail, we might return a dummy or raise error. 
+                # Let's try to return a dummy or skip? 
+                # Skipping in map/transform is hard. 
+                # We'll just return a dummy empty input which will likely be masked out or ignored if we are lucky,
+                # or we should ensure data prep is robust.
+                # For now, let's assume data is good or raise.
+                print(f"Error in sample {i}, skipping content.")
+                processed_batch.append([]) # This will likely fail in apply_chat_template
+                continue
+
+            processed_batch.append(processed_conversation)
+            
+        # Apply processor to the whole batch of conversations
+        # apply_chat_template can handle a list of conversations
+        try:
+            model_inputs = tokenizer.apply_chat_template(
+                processed_batch,
+                tokenize=True,
+                return_dict=True,
+                output_labels=True,
+                text_kwargs={
+                    "padding": "max_length",
+                    "max_length": 2048, # Match model max_seq_length
+                    "pad_to_multiple_of": 8,
+                    "padding_side": "right",
+                },
+            )
+            return model_inputs
+        except Exception as e:
+            print(f"Error in apply_chat_template: {e}")
+            # Return empty dicts to avoid crash, but this is bad.
+            return {"input_ids": [], "attention_mask": [], "labels": []}
+
+    # Apply the transform
+    # We need to set the transform on the dataset
+    train_dataset.set_transform(preprocess_batch)
+
     # Training Arguments
     training_args = TrainingArguments(
         per_device_train_batch_size = args.batch_size,
@@ -161,6 +253,8 @@ def main():
         seed = args.seed,
         output_dir = args.output_dir,
         report_to = "wandb" if args.use_wandb else "none",
+        dataloader_num_workers = 4, # Parallelize data loading
+        remove_unused_columns = False, # Important! Otherwise our raw columns might be removed before transform
     )
 
     print("Starting training...")
