@@ -5,17 +5,72 @@ from datasets import load_from_disk, concatenate_datasets
 from transformers import TrainingArguments, Trainer
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from pathlib import Path
+from dotenv import load_dotenv
+import yaml
+
+load_dotenv()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Sesame CSM model using Unsloth.")
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the prepared dataset directory containing shards.")
-    parser.add_argument("--output_dir", type=str, default="./outputs", help="Path to save the trained model/checkpoints.")
-    parser.add_argument("--max_steps", type=int, default=60, help="Max training steps.")
-    parser.add_argument("--batch_size", type=int, default=2, help="Per device train batch size.")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps.")
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate.")
-    parser.add_argument("--model_id", type=str, default="unsloth/csm-1b", help="Model ID to load.")
-    parser.add_argument("--seed", type=int, default=3407, help="Random seed.")
+    
+    # First, parse just the config argument to load defaults
+    conf_parser = argparse.ArgumentParser(add_help=False)
+    conf_parser.add_argument("--config", type=str, help="Path to YAML config file.")
+    known_args, remaining_args = conf_parser.parse_known_args()
+
+    defaults = {
+        "dataset_path": None,
+        "output_dir": "./outputs",
+        "max_steps": 60,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "learning_rate": 2e-4,
+        "model_id": "unsloth/csm-1b",
+        "seed": 3407,
+        "use_wandb": False,
+        "warmup_steps": 5,
+        "weight_decay": 0.001,
+        "lr_scheduler_type": "linear",
+        "max_grad_norm": 1.0,
+    }
+
+    if known_args.config:
+        try:
+            with open(known_args.config, "r") as f:
+                config = yaml.safe_load(f)
+                # Map config keys to arg keys if necessary
+                # Config: batch_size, grad_acc_steps, learning_rate, max_grad_norm, warmup_steps, weight_decay, lr_decay
+                mapping = {
+                    "grad_acc_steps": "gradient_accumulation_steps",
+                    "lr_decay": "lr_scheduler_type",
+                }
+                for k, v in config.items():
+                    key = mapping.get(k, k)
+                    if key in defaults:
+                        defaults[key] = v
+                    else:
+                        print(f"Warning: Config key '{k}' not supported by CLI, ignoring.")
+        except Exception as e:
+            print(f"Error loading config file: {e}")
+
+    # Now define the full parser with updated defaults
+    parser.add_argument("--config", type=str, help="Path to YAML config file.")
+    parser.add_argument("--dataset_path", type=str, required=defaults["dataset_path"] is None, default=defaults["dataset_path"], help="Path to the prepared dataset directory containing shards.")
+    parser.add_argument("--output_dir", type=str, default=defaults["output_dir"], help="Path to save the trained model/checkpoints.")
+    parser.add_argument("--max_steps", type=int, default=defaults["max_steps"], help="Max training steps.")
+    parser.add_argument("--batch_size", type=int, default=defaults["batch_size"], help="Per device train batch size.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=defaults["gradient_accumulation_steps"], help="Gradient accumulation steps.")
+    parser.add_argument("--learning_rate", type=float, default=defaults["learning_rate"], help="Learning rate.")
+    parser.add_argument("--model_id", type=str, default=defaults["model_id"], help="Model ID to load.")
+    parser.add_argument("--seed", type=int, default=defaults["seed"], help="Random seed.")
+    parser.add_argument("--use_wandb", action="store_true", default=defaults["use_wandb"], help="Enable Weights & Biases tracking.")
+    
+    # New arguments from config
+    parser.add_argument("--warmup_steps", type=int, default=defaults["warmup_steps"], help="Warmup steps.")
+    parser.add_argument("--weight_decay", type=float, default=defaults["weight_decay"], help="Weight decay.")
+    parser.add_argument("--lr_scheduler_type", type=str, default=defaults["lr_scheduler_type"], help="Learning rate scheduler type.")
+    parser.add_argument("--max_grad_norm", type=float, default=defaults["max_grad_norm"], help="Max gradient norm.")
+
     return parser.parse_args()
 
 def main():
@@ -75,18 +130,19 @@ def main():
     training_args = TrainingArguments(
         per_device_train_batch_size = args.batch_size,
         gradient_accumulation_steps = args.gradient_accumulation_steps,
-        warmup_steps = 5,
+        warmup_steps = args.warmup_steps,
         max_steps = args.max_steps,
         learning_rate = args.learning_rate,
         fp16 = not is_bfloat16_supported(),
         bf16 = is_bfloat16_supported(),
         logging_steps = 1,
         optim = "adamw_8bit",
-        weight_decay = 0.001,
-        lr_scheduler_type = "linear",
+        weight_decay = args.weight_decay,
+        lr_scheduler_type = args.lr_scheduler_type,
+        max_grad_norm = args.max_grad_norm,
         seed = args.seed,
         output_dir = args.output_dir,
-        report_to = "none",
+        report_to = "wandb" if args.use_wandb else "none",
     )
 
     print("Starting training...")
