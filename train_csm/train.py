@@ -1,9 +1,10 @@
+import unsloth 
 import argparse
 import os
 import torch
 from datasets import load_from_disk, concatenate_datasets
-from transformers import TrainingArguments, Trainer
-from unsloth import FastLanguageModel, is_bfloat16_supported
+from transformers import TrainingArguments, Trainer, CsmForConditionalGeneration, AutoProcessor
+from unsloth import FastModel, is_bfloat16_supported
 from pathlib import Path
 from dotenv import load_dotenv
 import yaml
@@ -89,24 +90,28 @@ def parse_args():
 
 def main():
     args = parse_args()
+    context_length = 2048
     
     print(f"Loading model: {args.model_id}")
-    # Load model and tokenizer using Unsloth
+    # Load model and processor using Unsloth
     # max_seq_length and dtype are usually inferred or set to defaults if not provided, 
     # but for CSM we might want to be careful. The notebook uses defaults in the snippet I saw, 
     # or specific config. Let's use standard loading.
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    model, processor = FastModel.from_pretrained(
         model_name = args.model_id,
-        max_seq_length = 2048, # From notebook context section
+        max_seq_length = context_length, # From notebook context section
         dtype = None, # Auto detection
-        load_in_4bit = False, # Disable 4bit quantization for macOS compatibility (and for full finetuning usually)
+        auto_model = CsmForConditionalGeneration,
+        load_in_4bit = True, # Disable 4bit quantization for macOS compatibility (and for full finetuning usually)
     )
 
+    processor = AutoProcessor.from_pretrained(args.model_id)
+    
     if not args.full_finetune:
         # Configure LoRA adapters
         # The notebook output showed "Trainable parameters = 29M", which implies LoRA.
         # We need to apply LoRA adapters to the model.
-        model = FastLanguageModel.get_peft_model(
+        model = FastModel.get_peft_model(
             model,
             r = 32, # Standard LoRA rank
             target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -213,14 +218,14 @@ def main():
         # Apply processor to the whole batch of conversations
         # apply_chat_template can handle a list of conversations
         try:
-            model_inputs = tokenizer.apply_chat_template(
+            model_inputs = processor.apply_chat_template(
                 processed_batch,
                 tokenize=True,
                 return_dict=True,
                 output_labels=True,
                 text_kwargs={
                     "padding": "max_length",
-                    "max_length": 2048, # Match model max_seq_length
+                    "max_length": context_length, # Match model max_seq_length
                     "pad_to_multiple_of": 8,
                     "padding_side": "right",
                 },
@@ -253,7 +258,7 @@ def main():
         seed = args.seed,
         output_dir = args.output_dir,
         report_to = "wandb" if args.use_wandb else "none",
-        dataloader_num_workers = 4, # Parallelize data loading
+        #dataloader_num_workers = 4, # Parallelize data loading
         remove_unused_columns = False, # Important! Otherwise our raw columns might be removed before transform
     )
 
@@ -261,11 +266,10 @@ def main():
     
     callbacks = []
     if args.gen_from:
-        callbacks.append(AudioGenerationCallback(args.gen_from, args.gen_every, tokenizer, args.use_wandb, args.output_dir))
+        callbacks.append(AudioGenerationCallback(args.gen_from, args.gen_every, processor, args.use_wandb, args.output_dir))
         
     trainer = Trainer(
         model = model,
-        tokenizer = tokenizer,
         train_dataset = train_dataset,
         args = training_args,
         callbacks = callbacks
@@ -279,7 +283,7 @@ def main():
     # Save model
     print(f"Saving model to {args.output_dir}")
     model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    processor.save_pretrained(args.output_dir)
     # Also save to GGUF if needed? Notebook mentions saving. 
     # For now, standard pretrained save is enough.
 

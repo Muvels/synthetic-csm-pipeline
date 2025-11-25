@@ -10,4 +10,8 @@ synthetic-dataset
 **/test_dataset_dummy
 **/test_dataset_dummy_train
 **/dataset-for-training
-
+prepared_dataset/
+**/*.Identifier
+unsloth_compiled_cache/
+__pycache__
+synthetic-dataset.tar.gz
