@@ -7,7 +7,7 @@ from transformers import TrainingArguments, Trainer, CsmForConditionalGeneration
 from unsloth import FastModel, is_bfloat16_supported
 from pathlib import Path
 from dotenv import load_dotenv
-import yaml
+import yamlx
 import soundfile as sf
 import re
 import numpy as np
@@ -42,6 +42,8 @@ def parse_args():
         "weight_decay": 0.001,
         "lr_scheduler_type": "linear",
         "max_grad_norm": 1.0,
+        "context_length": 2048,
+        "save_every": 500,
     }
 
     if known_args.config:
@@ -85,12 +87,13 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=defaults["weight_decay"], help="Weight decay.")
     parser.add_argument("--lr_scheduler_type", type=str, default=defaults["lr_scheduler_type"], help="Learning rate scheduler type.")
     parser.add_argument("--max_grad_norm", type=float, default=defaults["max_grad_norm"], help="Max gradient norm.")
+    parser.add_argument("--context_length", type=int, default=defaults["context_length"], help="Max context length (tokens).")
+    parser.add_argument("--save_every", type=int, default=defaults["save_every"], help="Save checkpoint every N steps.")
 
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    context_length = 2048
     
     print(f"Loading model: {args.model_id}")
     # Load model and processor using Unsloth
@@ -99,7 +102,7 @@ def main():
     # or specific config. Let's use standard loading.
     model, processor = FastModel.from_pretrained(
         model_name = args.model_id,
-        max_seq_length = context_length, # From notebook context section
+        max_seq_length = args.context_length,
         dtype = None, # Auto detection
         auto_model = CsmForConditionalGeneration,
         load_in_4bit = True, # Disable 4bit quantization for macOS compatibility (and for full finetuning usually)
@@ -224,8 +227,9 @@ def main():
                 return_dict=True,
                 output_labels=True,
                 text_kwargs={
-                    "padding": "max_length",
-                    "max_length": context_length, # Match model max_seq_length
+                    "padding": "longest", # Dynamic padding: pad to the longest in the batch
+                    "max_length": args.context_length, 
+                    "truncation": True, # Truncate if exceeding max length
                     "pad_to_multiple_of": 8,
                     "padding_side": "right",
                 },
@@ -260,6 +264,9 @@ def main():
         report_to = "wandb" if args.use_wandb else "none",
         #dataloader_num_workers = 4, # Parallelize data loading
         remove_unused_columns = False, # Important! Otherwise our raw columns might be removed before transform
+        save_strategy = "steps",
+        save_steps = args.save_every,
+        save_total_limit = 3, # Keep only the last 3 checkpoints to save disk space
     )
 
     print("Starting training...")
