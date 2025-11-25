@@ -228,6 +228,10 @@ def diarize_and_save_embeddings(
     waveform = torch.from_numpy(samples).unsqueeze(0)
     sample_rate = audio.frame_rate
     
+    # Calculate exact duration in seconds to prevent out-of-bounds errors
+    # Subtract a tiny epsilon to ensure we are strictly within bounds for pyannote
+    audio_duration = (waveform.shape[1] / sample_rate) - 0.01
+    
     diarization = diarization_pipeline({"waveform": waveform, "sample_rate": sample_rate})
     
     # Handle DiarizeOutput wrapper if present (common when passing dict input)
@@ -236,18 +240,139 @@ def diarize_and_save_embeddings(
 
     # ---- Save diarization to JSON ----
     diarization_path = get_diarization_path(meta_dir, file_basename)
-    diar_segments: List[Dict[str, float]] = []
-    local_speakers_segments: Dict[str, List[Segment]] = {}
+    
+    # 1. Collect all turns and stats
+    all_turns = []
+    speaker_durations: Dict[str, float] = {}
+    speaker_segments: Dict[str, List[Segment]] = {} # speaker -> list of Segments
 
     for turn, _, speaker in diarization.itertracks(yield_label=True):
-        diar_segments.append(
-            {
-                "start": float(turn.start),
-                "end": float(turn.end),
-                "speaker": str(speaker),
-            }
-        )
-        local_speakers_segments.setdefault(str(speaker), []).append(turn)
+        orig_speaker = str(speaker)
+        
+        # Clamp segment to audio duration
+        t_start = float(turn.start)
+        t_end = min(float(turn.end), audio_duration)
+        
+        if t_end <= t_start:
+            continue
+            
+        dur = t_end - t_start
+        
+        speaker_durations[orig_speaker] = speaker_durations.get(orig_speaker, 0.0) + dur
+        
+        # Store turn info
+        all_turns.append({
+            "start": t_start,
+            "end": t_end,
+            "speaker": orig_speaker
+        })
+        
+        # Store segment for embedding extraction
+        clamped_turn = Segment(t_start, t_end)
+        speaker_segments.setdefault(orig_speaker, []).append(clamped_turn)
+
+    # 2. Identify top 2 speakers
+    # Sort by duration descending
+    sorted_speakers = sorted(speaker_durations.keys(), key=lambda s: speaker_durations[s], reverse=True)
+    
+    if not sorted_speakers:
+        print(f"Stage1: No speech segments found in '{file_basename}', skipping.")
+        return
+
+    canonical_speakers = sorted_speakers[:2]
+    minor_speakers = sorted_speakers[2:]
+    
+    # 3. Compute embeddings for ALL detected speakers
+    speaker_embeddings: Dict[str, np.ndarray] = {}
+    
+    for spk in sorted_speakers:
+        segments = speaker_segments.get(spk, [])
+        
+        # Pick the longest segment above min duration
+        longest: Optional[Segment] = None
+        longest_duration = 0.0
+
+        for seg in segments:
+            dur = float(seg.end - seg.start)
+            if dur < EMBEDDING_MIN_DURATION:
+                continue
+            if dur > longest_duration:
+                longest_duration = dur
+                longest = seg
+
+        # Fallback: if none above threshold, take the actual longest segment
+        if longest is None and segments:
+            longest = max(segments, key=lambda s: float(s.end - s.start))
+            longest_duration = float(longest.end - longest.start)
+
+        if longest is None or longest_duration <= 0.0:
+            continue
+
+        # Extract embedding
+        # Double check clamping just in case (though we clamped on creation)
+        start_t = float(longest.start)
+        end_t = min(float(longest.end), audio_duration)
+        
+        excerpt = Segment(start_t, end_t)
+        try:
+            emb = inference.crop({"waveform": waveform, "sample_rate": sample_rate}, excerpt)
+            emb_np = np.asarray(emb, dtype=np.float32).squeeze()
+            speaker_embeddings[spk] = emb_np
+        except Exception as e:
+            print(f"Warning: Failed to extract embedding for speaker {spk}: {e}")
+
+    # 4. Build Mapping
+    speaker_map: Dict[str, str] = {}
+    
+    # Identity mapping for canonicals
+    for spk in canonical_speakers:
+        speaker_map[spk] = spk
+        
+    # Similarity mapping for minors
+    for spk in minor_speakers:
+        emb_s = speaker_embeddings.get(spk)
+        
+        # Default fallback: map to the first canonical speaker (usually the most dominant)
+        best_match = canonical_speakers[0]
+        
+        if emb_s is not None:
+            best_sim = -2.0 # Cosine sim is [-1, 1]
+            
+            # Normalize source embedding
+            norm_s = np.linalg.norm(emb_s)
+            if norm_s > 1e-12:
+                emb_s_norm = emb_s / norm_s
+            else:
+                emb_s_norm = emb_s
+
+            for cand in canonical_speakers:
+                emb_c = speaker_embeddings.get(cand)
+                if emb_c is None:
+                    continue
+                
+                # Normalize candidate embedding
+                norm_c = np.linalg.norm(emb_c)
+                if norm_c > 1e-12:
+                    emb_c_norm = emb_c / norm_c
+                else:
+                    emb_c_norm = emb_c
+                
+                sim = np.dot(emb_s_norm, emb_c_norm)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_match = cand
+        
+        speaker_map[spk] = best_match
+
+    # 5. Build final diarization list
+    diar_segments: List[Dict[str, float]] = []
+    for turn in all_turns:
+        mapped_speaker = speaker_map.get(turn["speaker"], canonical_speakers[0])
+        diar_segments.append({
+            "start": turn["start"],
+            "end": turn["end"],
+            "speaker": mapped_speaker
+        })
 
     diar_json = {
         "sample_rate": 16000,  # pyannote internally resamples to 16kHz
@@ -257,45 +382,18 @@ def diarize_and_save_embeddings(
     with open(diarization_path, "w", encoding="utf-8") as f:
         json.dump(diar_json, f, indent=2)
 
-    # ---- Compute one embedding per local speaker (longest segment) ----
-    embeddings: List[np.ndarray] = []
-    local_labels: List[str] = []
+    # 6. Save Embeddings (only canonicals)
+    final_embeddings: List[np.ndarray] = []
+    final_labels: List[str] = []
+    
+    for spk in canonical_speakers:
+        if spk in speaker_embeddings:
+            final_embeddings.append(speaker_embeddings[spk])
+            final_labels.append(str(spk))
 
-    if not local_speakers_segments:
-        print(f"Stage1: No speech segments found in '{file_basename}', skipping embeddings.")
-    else:
-        for speaker, segments in local_speakers_segments.items():
-            # Pick the longest segment above min duration
-            longest: Optional[Segment] = None
-            longest_duration = 0.0
-
-            for seg in segments:
-                dur = float(seg.end - seg.start)
-                if dur < EMBEDDING_MIN_DURATION:
-                    continue
-                if dur > longest_duration:
-                    longest_duration = dur
-                    longest = seg
-
-            # Fallback: if none above threshold, take the actual longest segment
-            if longest is None and segments:
-                longest = max(segments, key=lambda s: float(s.end - s.start))
-                longest_duration = float(longest.end - longest.start)
-
-            if longest is None or longest_duration <= 0.0:
-                continue
-
-            # Extract embedding using pyannote Inference helper
-            excerpt = Segment(float(longest.start), float(longest.end))
-            # Fix for torchcodec error: use preloaded audio
-            emb = inference.crop({"waveform": waveform, "sample_rate": sample_rate}, excerpt)
-            emb_np = np.asarray(emb, dtype=np.float32).squeeze()
-            embeddings.append(emb_np)
-            local_labels.append(str(speaker))
-
-    if embeddings:
-        emb_array = np.stack(embeddings, axis=0)
-        local_labels_array = np.array(local_labels, dtype=object)
+    if final_embeddings:
+        emb_array = np.stack(final_embeddings, axis=0)
+        local_labels_array = np.array(final_labels, dtype=object)
 
         emb_path = get_embeddings_path(meta_dir, file_basename)
         np.savez_compressed(
@@ -364,6 +462,9 @@ def cluster_global_speakers(meta_dir: str, similarity_threshold: float) -> Dict[
     norms[norms == 0] = 1.0
     all_embeddings_arr = all_embeddings_arr / norms
 
+    # We hard-limit the number of global speakers to TWO.
+    max_global_speakers = 2
+
     cluster_centers: List[np.ndarray] = []
     cluster_counts: List[int] = []
     mapping: Dict[Tuple[str, str], int] = {}
@@ -384,19 +485,32 @@ def cluster_global_speakers(meta_dir: str, similarity_threshold: float) -> Dict[
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
 
-        if best_sim >= similarity_threshold:
-            # assign to existing cluster and update center via running mean
+        # If we don't yet have two clusters, we can still create a new one
+        # based on the similarity threshold. Once we have two, we ALWAYS
+        # assign to the closest existing cluster (no new clusters).
+        if len(cluster_centers) < max_global_speakers:
+            if best_sim >= similarity_threshold:
+                # assign to existing cluster and update center via running mean
+                count = cluster_counts[best_idx]
+                new_center = (cluster_centers[best_idx] * count + emb) / (count + 1)
+                new_center = new_center / max(np.linalg.norm(new_center), 1e-12)
+                cluster_centers[best_idx] = new_center
+                cluster_counts[best_idx] = count + 1
+                global_id = best_idx + 1  # 1-based
+            else:
+                cluster_centers.append(emb.copy())
+                cluster_counts.append(1)
+                global_id = next_global_id
+                next_global_id += 1
+        else:
+            # We already have the maximum number of global speakers.
+            # Force assignment to the closest existing cluster regardless of threshold.
             count = cluster_counts[best_idx]
             new_center = (cluster_centers[best_idx] * count + emb) / (count + 1)
             new_center = new_center / max(np.linalg.norm(new_center), 1e-12)
             cluster_centers[best_idx] = new_center
             cluster_counts[best_idx] = count + 1
             global_id = best_idx + 1  # 1-based
-        else:
-            cluster_centers.append(emb.copy())
-            cluster_counts.append(1)
-            global_id = next_global_id
-            next_global_id += 1
 
         mapping[key] = global_id
 
@@ -598,7 +712,7 @@ def transcribe_and_generate_segments(
         end_ms = max(start_ms + 1, int(end_sec * 1000))
         segment_audio = audio[start_ms:end_ms]
 
-        segment_filename = f"segment_{i+1:04d}_speaker{global_speaker_id}.wav"
+        segment_filename = f"{i+1:03d}_speaker{global_speaker_id}.wav"
         segment_path = os.path.join(output_dir, segment_filename)
         segment_audio.export(segment_path, format="wav")
 
