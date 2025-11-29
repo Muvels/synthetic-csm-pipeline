@@ -1,8 +1,28 @@
+# Sesame CSM Fine-tuning Configuration
+# Lower VRAM settings (suitable for GPUs with ~8-12GB VRAM)
+
+# Dataset settings
+num_context_turns: 2         # Fewer context turns to save memory
+max_audio_seconds: 12.0      # Shorter audio clips
+context_length: 1024         # Reduced context length
+
+# Training hyperparameters
 batch_size: 2
-grad_acc_steps: 4
-learning_rate: 0.00003
-max_grad_norm: 1.3
+grad_acc_steps: 4            # Effective batch size = 2 * 4 = 8
+learning_rate: 0.00003       # 3e-5
 warmup_steps: 1000
 weight_decay: 0.002
 lr_decay: linear
-decoder_loss_weight: 0.5
+max_grad_norm: 1.3
+
+# LoRA settings (smaller for lower VRAM)
+lora_r: 16
+lora_alpha: 16
+
+# Checkpointing & Generation
+save_every: 500
+gen_every: 2000              # Generate less often to save memory
+
+# Training length
+num_train_epochs: 2
+max_steps: -1

@@ -1,15 +1,28 @@
+# Sesame CSM Fine-tuning Configuration
+# Balanced parameters for batch size 4
+
+# Dataset settings
+num_context_turns: 3         # Number of previous turns to include as context
+max_audio_seconds: 15.0      # Maximum audio length in seconds
+context_length: 2048         # Max context length in tokens
+
+# Training hyperparameters
 batch_size: 4
-grad_acc_steps: 2
-learning_rate: 0.00003
-max_grad_norm: 1.3
+grad_acc_steps: 2            # Effective batch size = 4 * 2 = 8
+learning_rate: 0.00003       # 3e-5
 warmup_steps: 1000
 weight_decay: 0.002
 lr_decay: linear
-decoder_loss_weight: 0.5
+max_grad_norm: 1.3
 
+# LoRA settings
+lora_r: 32
+lora_alpha: 32
 
+# Checkpointing & Generation
+save_every: 500
+gen_every: 1000
 
-
-
-
-
+# Training length
+num_train_epochs: 2
+max_steps: -1
