@@ -20,12 +20,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import soundfile as sf
 import torch
 import yaml
 from safetensors.torch import save_file
 from tqdm import tqdm
-from transformers import AutoProcessor
+from transformers import AutoProcessor, CsmForConditionalGeneration
+
+
+# Global model reference for audio encoding
+_audio_encoder = None
+_audio_encoder_device = None
 
 
 @dataclass
@@ -46,6 +52,96 @@ def load_config_from_yaml(yaml_path: str) -> dict:
     """Load configuration from YAML file."""
     with open(yaml_path, "r") as f:
         return yaml.safe_load(f)
+
+
+def init_audio_encoder(model_id: str, device: str = "cuda"):
+    """
+    Initialize the CSM model's audio encoder for generating codebook_labels.
+    The audio encoder (Mimi codec) converts audio waveforms to discrete tokens.
+    """
+    global _audio_encoder, _audio_encoder_device
+    
+    if _audio_encoder is not None:
+        return _audio_encoder
+    
+    print(f"Loading audio encoder from {model_id}...")
+    
+    # Load the full model to get access to the audio encoder
+    model = CsmForConditionalGeneration.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map=device,
+    )
+    
+    # The audio encoder is part of the model
+    _audio_encoder = model
+    _audio_encoder_device = device
+    
+    print(f"Audio encoder loaded on {device}")
+    return _audio_encoder
+
+
+def encode_audio_to_codebook(
+    audio_array,
+    sampling_rate: int,
+    model,
+    processor,
+) -> torch.Tensor:
+    """
+    Encode audio waveform to codebook labels using the model's audio codec.
+    
+    Args:
+        audio_array: numpy array of audio samples
+        sampling_rate: audio sampling rate
+        model: CSM model with audio encoder
+        processor: CSM processor
+    
+    Returns:
+        codebook_labels: tensor of shape [num_codebooks, seq_len]
+    """
+    import numpy as np
+    
+    # Ensure audio is float32 numpy array
+    if isinstance(audio_array, torch.Tensor):
+        audio_array = audio_array.numpy()
+    audio_array = audio_array.astype(np.float32)
+    
+    # Prepare audio input
+    if audio_array.ndim == 1:
+        audio_array = audio_array[np.newaxis, :]  # Add channel dim
+    
+    # Convert to tensor and move to device
+    audio_tensor = torch.from_numpy(audio_array).unsqueeze(0)  # [1, channels, samples]
+    if audio_tensor.dim() == 2:
+        audio_tensor = audio_tensor.unsqueeze(1)  # [1, 1, samples]
+    
+    device = next(model.parameters()).device
+    audio_tensor = audio_tensor.to(device=device, dtype=torch.float32)
+    
+    # Use the model's audio encoder to get codebook indices
+    with torch.no_grad():
+        # The CSM model has an audio_encoder that encodes audio to codes
+        # Access it through the depth_decoder which uses the codec
+        if hasattr(model, 'audio_encoder'):
+            # Direct access to audio encoder
+            codes = model.audio_encoder.encode(audio_tensor)
+        elif hasattr(model, 'model') and hasattr(model.model, 'audio_encoder'):
+            codes = model.model.audio_encoder.encode(audio_tensor)
+        else:
+            # Try to find the codec in the model structure
+            # CSM uses Mimi codec, which might be accessed differently
+            # Fallback: use the processor's feature extractor if available
+            raise ValueError(
+                "Could not find audio encoder in model. "
+                "Model structure may have changed. "
+                f"Available attributes: {dir(model)}"
+            )
+    
+    # codes shape is typically [batch, num_codebooks, seq_len]
+    # Remove batch dimension
+    codebook_labels = codes.squeeze(0).cpu()
+    
+    return codebook_labels
 
 
 def parse_script_file(script_path: Path) -> list[dict]:
@@ -151,10 +247,18 @@ def process_conversation(
     config: PreprocessConfig,
     processor: AutoProcessor,
     output_dir: Path,
+    model = None,  # CSM model for audio encoding
 ) -> list[dict]:
     """
     Process a single conversation and save tokenized samples.
     Returns list of manifest entries.
+    
+    Args:
+        conversation: dict with 'id', 'path', 'samples'
+        config: preprocessing configuration
+        processor: CSM processor
+        output_dir: where to save preprocessed files
+        model: CSM model for generating codebook_labels (optional, but needed for full training)
     """
     import numpy as np
     
@@ -266,14 +370,149 @@ def process_conversation(
             continue
         
         # Extract tensors (remove batch dimension)
+        # The processor returns tensors with batch dimension first, e.g.:
+        #   input_ids: [1, seq_len]
+        #   codebook_labels: [1, num_codebooks, seq_len]
+        # We remove the batch dimension to get:
+        #   input_ids: [seq_len]
+        #   codebook_labels: [num_codebooks, seq_len]
         tensors = {}
-        for key in ["input_ids", "attention_mask", "labels", "input_values", "input_values_cutoffs", "codebook_labels"]:
+        for key in ["input_ids", "attention_mask", "labels", "input_values", "input_values_cutoffs"]:
             if key in model_inputs:
                 val = model_inputs[key]
                 if isinstance(val, torch.Tensor):
-                    tensors[key] = val[0] if val.dim() > 1 else val
+                    # Remove batch dimension (always the first dimension)
+                    if val.dim() >= 1 and val.shape[0] == 1:
+                        tensors[key] = val.squeeze(0)
+                    else:
+                        tensors[key] = val
+                    # Debug: print shape for first sample
+                    if sample_idx == 0:
+                        print(f"    {key}: {val.shape} -> {tensors[key].shape}")
                 elif isinstance(val, list):
                     tensors[key] = torch.tensor(val[0] if isinstance(val[0], list) else val)
+            else:
+                if sample_idx == 0:
+                    print(f"    WARNING: {key} not in model_inputs!")
+        
+        # Generate codebook_labels using the model's audio encoder
+        # This encodes all audio segments through the codec to get discrete tokens
+        if model is not None:
+            try:
+                # Concatenate all audio from conversation turns
+                all_audio = []
+                for turn in conversation_turns:
+                    for content in turn["content"]:
+                        if content["type"] == "audio":
+                            audio_data = content["path"]  # This is the numpy array
+                            all_audio.append(audio_data)
+                
+                if all_audio:
+                    # Stack audio segments
+                    combined_audio = np.concatenate(all_audio)
+                    
+                    # Encode through the model's audio codec
+                    audio_tensor = torch.from_numpy(combined_audio)
+                    if audio_tensor.dim() == 1:
+                        audio_tensor = audio_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, samples]
+                    elif audio_tensor.dim() == 2:
+                        audio_tensor = audio_tensor.unsqueeze(0)  # [1, channels, samples]
+                    
+                    # Match model's device and dtype
+                    device = next(model.parameters()).device
+                    dtype = next(model.parameters()).dtype
+                    audio_tensor = audio_tensor.to(device=device, dtype=dtype)
+                    
+                    with torch.no_grad():
+                        # Try different ways to access the audio encoder
+                        encoder = None
+                        encode_method = None
+                        
+                        # Method 1: Direct audio_encoder attribute
+                        if hasattr(model, 'audio_encoder'):
+                            encoder = model.audio_encoder
+                        # Method 2: Through model.model
+                        elif hasattr(model, 'model') and hasattr(model.model, 'audio_encoder'):
+                            encoder = model.model.audio_encoder
+                        # Method 3: Look for codec/mimi in named modules
+                        else:
+                            for name, module in model.named_modules():
+                                if any(x in name.lower() for x in ['audio_encoder', 'mimi', 'codec', 'encodec']):
+                                    if hasattr(module, 'encode'):
+                                        encoder = module
+                                        break
+                        
+                        # Find the encode method
+                        if encoder is not None:
+                            if hasattr(encoder, 'encode'):
+                                encode_method = encoder.encode
+                            elif hasattr(encoder, 'forward'):
+                                encode_method = encoder.forward
+                        
+                        if encode_method is not None:
+                            try:
+                                output = encode_method(audio_tensor)
+                                
+                                # Handle different return types
+                                # MimiModel returns MimiEncoderOutput with audio_codes attribute
+                                if hasattr(output, 'audio_codes'):
+                                    codes = output.audio_codes
+                                elif hasattr(output, 'codes'):
+                                    codes = output.codes
+                                elif hasattr(output, 'last_hidden_state'):
+                                    codes = output.last_hidden_state
+                                elif isinstance(output, tuple):
+                                    codes = output[0]
+                                elif isinstance(output, torch.Tensor):
+                                    codes = output
+                                else:
+                                    # Debug: print what we got
+                                    if sample_idx == 0:
+                                        print(f"    Output type: {type(output)}")
+                                        print(f"    Output attributes: {[a for a in dir(output) if not a.startswith('_')]}")
+                                    raise ValueError(f"Unknown output type: {type(output)}")
+                                
+                                # codes: [batch, num_codebooks, seq_len] or similar
+                                if codes.dim() == 3:
+                                    codebook_labels = codes.squeeze(0).cpu()
+                                elif codes.dim() == 2:
+                                    codebook_labels = codes.cpu()
+                                else:
+                                    codebook_labels = codes.view(-1, codes.shape[-1]).cpu()
+                                
+                                # Convert to long for labels (they should be discrete tokens)
+                                codebook_labels = codebook_labels.long()
+                                
+                                tensors["codebook_labels"] = codebook_labels
+                                if sample_idx == 0:
+                                    print(f"    codebook_labels: generated shape {codebook_labels.shape}, dtype {codebook_labels.dtype}")
+                            except Exception as enc_err:
+                                if sample_idx == 0:
+                                    print(f"    WARNING: Encoder failed: {enc_err}")
+                                    # Print encoder type for debugging
+                                    print(f"    Encoder type: {type(encoder)}")
+                        else:
+                            if sample_idx == 0:
+                                print(f"    WARNING: Could not find audio encoder in model")
+                                # Print model structure for debugging
+                                print(f"    Model type: {type(model)}")
+                                print(f"    Model attributes: {[a for a in dir(model) if not a.startswith('_')][:20]}")
+                                
+            except Exception as e:
+                if sample_idx == 0:
+                    import traceback
+                    print(f"    WARNING: Failed to generate codebook_labels: {e}")
+                    traceback.print_exc()
+        else:
+            # Check if processor returned codebook_labels (unlikely but check)
+            if "codebook_labels" in model_inputs:
+                val = model_inputs["codebook_labels"]
+                if isinstance(val, torch.Tensor):
+                    tensors["codebook_labels"] = val.squeeze(0) if val.dim() >= 1 and val.shape[0] == 1 else val
+                    if sample_idx == 0:
+                        print(f"    codebook_labels: {val.shape} -> {tensors['codebook_labels'].shape}")
+            elif sample_idx == 0:
+                print(f"    WARNING: codebook_labels not available (model not provided)")
         
         # Add metadata
         num_audio_segments = len(conversation_turns)
@@ -371,6 +610,29 @@ def main():
     print("\nLoading processor...")
     processor = AutoProcessor.from_pretrained(config.model_id)
     
+    # Load model for audio encoding (needed for codebook_labels)
+    print("\nLoading model for audio encoding...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CsmForConditionalGeneration.from_pretrained(
+        config.model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
+    model = model.to(device)
+    model.eval()
+    print(f"Model loaded on {device}")
+    
+    # Debug: print model structure to find audio encoder
+    print("\nModel structure for audio encoding:")
+    if hasattr(model, 'audio_encoder'):
+        print(f"  audio_encoder: {type(model.audio_encoder)}")
+    if hasattr(model, 'model'):
+        if hasattr(model.model, 'audio_encoder'):
+            print(f"  model.audio_encoder: {type(model.model.audio_encoder)}")
+    # List all modules containing 'audio' or 'codec' or 'mimi'
+    for name, module in model.named_modules():
+        if any(x in name.lower() for x in ['audio', 'codec', 'mimi', 'encodec']):
+            print(f"  {name}: {type(module).__name__}")
+    
     # Scan conversations
     print("\nScanning dataset...")
     conversations = scan_conversations(input_path)
@@ -386,7 +648,7 @@ def main():
     total_samples = 0
     
     for conv in tqdm(conversations, desc="Conversations"):
-        entries = process_conversation(conv, config, processor, output_path)
+        entries = process_conversation(conv, config, processor, output_path, model=model)
         all_manifest_entries.extend(entries)
         total_samples += len(entries)
     
