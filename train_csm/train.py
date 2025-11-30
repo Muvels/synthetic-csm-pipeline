@@ -230,6 +230,7 @@ def create_hf_dataset(
             "labels",
             "input_values",
             "input_values_cutoffs",
+            "codebook_labels",
         ]
         
         processed = {}
@@ -435,6 +436,7 @@ def create_hf_dataset_with_context(
             "labels",
             "input_values",
             "input_values_cutoffs",
+            "codebook_labels",
         ]
         
         processed = {}
@@ -704,7 +706,7 @@ def csm_data_collator(features: list) -> dict:
                     if len(v.shape) == 1:
                         pad_size = max_dims[0] - v.shape[0]
                         if pad_size > 0:
-                            if key == "labels":
+                            if key in ("labels", "codebook_labels"):
                                 pad_value = -100  # Ignored in loss
                             elif key == "input_values_cutoffs":
                                 # Pad with the last cutoff value
@@ -722,6 +724,9 @@ def csm_data_collator(features: list) -> dict:
                                 # For audio: use 'replicate' mode (repeat edge values)
                                 # This avoids issues with zero padding in audio encoder
                                 v = torch.nn.functional.pad(v, (0, pad_w, 0, pad_h), mode='replicate')
+                            elif key == "codebook_labels":
+                                # For codebook labels: use -100 (ignored in loss)
+                                v = torch.nn.functional.pad(v, (0, pad_w, 0, pad_h), value=-100)
                             else:
                                 v = torch.nn.functional.pad(v, (0, pad_w, 0, pad_h), value=0)
                     padded.append(v)
@@ -741,7 +746,7 @@ def csm_data_collator(features: list) -> dict:
                     if len(v.shape) == 1:
                         pad_size = max_dims[0] - v.shape[0]
                         if pad_size > 0:
-                            if key == "labels":
+                            if key in ("labels", "codebook_labels"):
                                 pad_value = -100
                             elif key == "input_values_cutoffs":
                                 pad_value = int(v[-1]) if len(v) > 0 else 0
@@ -755,6 +760,9 @@ def csm_data_collator(features: list) -> dict:
                             if key == "input_values":
                                 # For audio: use 'edge' mode (repeat edge values)
                                 v = np.pad(v, ((0, pad_h), (0, pad_w)), mode='edge')
+                            elif key == "codebook_labels":
+                                # For codebook labels: use -100 (ignored in loss)
+                                v = np.pad(v, ((0, pad_h), (0, pad_w)), constant_values=-100)
                             else:
                                 v = np.pad(v, ((0, pad_h), (0, pad_w)), constant_values=0)
                     padded.append(v)

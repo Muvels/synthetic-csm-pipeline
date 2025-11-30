@@ -90,6 +90,9 @@ def scan_conversations(input_path: Path) -> list[dict]:
             # Nested structure: input_path/lang/conv_name/segments
             conv_dirs = [d for d in lang_dir.iterdir() if d.is_dir() and (d / "segments").exists()]
         
+        print(f"Found {len(conv_dirs)} conversation directories")
+        print(f"Conversation directories: {conv_dirs}")
+        
         for conv_dir in conv_dirs:
             seg_dir = conv_dir / "segments"
             script_path = seg_dir / "vibevoice-podcast-script.txt"
@@ -264,7 +267,7 @@ def process_conversation(
         
         # Extract tensors (remove batch dimension)
         tensors = {}
-        for key in ["input_ids", "attention_mask", "labels", "input_values", "input_values_cutoffs"]:
+        for key in ["input_ids", "attention_mask", "labels", "input_values", "input_values_cutoffs", "codebook_labels"]:
             if key in model_inputs:
                 val = model_inputs[key]
                 if isinstance(val, torch.Tensor):
